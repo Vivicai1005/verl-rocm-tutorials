@@ -1,3 +1,6 @@
+# 深入 verl Fully Async Training：从架构原理到 DAPO 训练实践 
+
+从 `dapo_7b_math_fsdp2_4_4.sh`去理解verl fully async的工作流
 ```mermaid
 flowchart TD
     A["dapo_7b_math_fsdp2_4_4.sh"]
@@ -43,6 +46,62 @@ flowchart TD
 
     T7 -.-> R
 ```
+<details>
+<summary>fully_async_main.py中main()代码</summary>
+    
+```python 
+@hydra.main(config_path="config", config_name="fully_async_ppo_trainer", version_base=None)
+def main(config):
+    from verl.trainer.main_ppo import run_ppo
+
+    # Ensure async training config exists
+    if not hasattr(config, "async_training"):
+        raise RuntimeError("must set async_training config")
+
+    from time import time
+
+    start_time = time()
+    auto_set_device(config)
+    # TODO: unify rollout config with actor_rollout_ref
+    config.actor_rollout_ref.rollout.nnodes = config.rollout.nnodes
+    config.actor_rollout_ref.rollout.n_gpus_per_node = config.rollout.n_gpus_per_node
+    config = migrate_legacy_reward_impl(config)
+    run_ppo(config, task_runner_class=FullyAsyncTaskRunner)
+    print(f"total time: {time() - start_time:.2f} seconds")
+```
+</details>
+
+## Init
+```
+dapo_7b_math_fsdp2_4_4.sh
+        │
+        ▼
+python -m verl.experimental.fully_async_policy.fully_async_main
+        │
+        ▼
+main(config)
+        │
+        ▼
+run_ppo(config, FullyAsyncTaskRunner)
+        │
+        ▼
+FullyAsyncTaskRunner.run(config)
+        │
+        ▼
+_initialize_components(config)
+```
+Ray 是一个统计计算框架，旨在实现简单地从单机到大型分布式集群的扩展，提供构建和运行分布式应用的底层基础设置和一组核心原语。
+Ray Task 是 Ray 中最基本的计算单元，代表一个无状态的远程函数。Ray Task的每次执行都是独立的，不保留之前的任何信息。就像调用一个普通函数，执行完就清除内部状态。我们调用一个 Ray Task 后，会立即返回得到一个Ray ObjectRef，而不是实际的结果。主程序可以继续执行其他操作，而 Ray Task 则在后台并行运行。
+
+`run_ppo` 负责初始化Ray集群，配置CPU资源和运行时环境变量，并创建FullyAsyncRunner。
+FullyAsyncRunner 初始化 Trainer, Rollouter 和 MessageQueue,然后`_run_training_loop()` 同时启动 `rollouter.fit.remote()` 与 `trainer.fit.remote()`，二者独立运行。
+
+## FullyAsyncRollouter
+
+## FullyAsyncTrainer
+
+## Update weights
+
 
 ```mermaid
 sequenceDiagram
