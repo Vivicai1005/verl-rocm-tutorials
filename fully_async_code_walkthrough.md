@@ -120,7 +120,6 @@ flowchart TB
     end
 
     Runner -. "initialize & orchestrate" .-> AsyncSystem
-    Runner -. "initialize" .-> CE
 ```
 
 Ray 是一个统计计算框架，旨在实现简单地从单机到大型分布式集群的扩展，提供构建和运行分布式应用的底层基础设置和一组核心原语。
@@ -175,6 +174,7 @@ sequenceDiagram
 > - **Consumer**：负责从缓冲区取出数据进行处理。如果缓冲区空了，消费者必须等待。
 > - **Buffer**：平滑了生产和消费的速率波动，允许两者并行工作，互不阻塞。
 
+`FullyAsyncRollouter` 是 Fully Async Training 中的 rollout producer。它持续从训练数据集中读取prompt，将rollout request放入内部 `pending queue`
 
 
 
