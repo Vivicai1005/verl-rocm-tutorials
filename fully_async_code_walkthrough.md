@@ -47,7 +47,7 @@ flowchart TD
     T7 -.-> R
 ```
 
-## Init
+## FullyAsyncTaskRunner
 ```
 dapo_7b_math_fsdp2_4_4.sh
         │
@@ -62,9 +62,6 @@ run_ppo(config, FullyAsyncTaskRunner)
         │
         ▼
 FullyAsyncTaskRunner.run(config)
-        │
-        ▼
-_initialize_components(config)
 ```
 <details>
 <summary>fully_async_main.py中main()代码</summary>
@@ -91,6 +88,41 @@ def main(config):
 ```
 </details>
 
+```mermaid
+flowchart TB
+
+    Runner["FullyAsyncTaskRunner<br/>Orchestrator"]
+
+    subgraph AsyncSystem["Fully Async Training System"]
+        direction TB
+
+        subgraph SampleFlow["Rollout Sample Path"]
+            direction LR
+
+            R["FullyAsyncRollouter<br/>Producer"]
+            MQ["MessageQueue<br/>Buffer"]
+            T["FullyAsyncTrainer<br/>Consumer"]
+
+            R -->|"Rollout Samples"| MQ
+            MQ -->|"Training Samples"| T
+        end
+
+        subgraph WeightFlow["Policy Weight Sync Path"]
+            direction RL
+
+            V["vLLM Rollout Replicas"]
+            CE["CheckpointEngineManager"]
+
+            CE -->|"Sync Weights"| V
+        end
+
+        SampleFlow -->|"Updated Policy"| WeightFlow
+    end
+
+    Runner -. "initialize & orchestrate" .-> AsyncSystem
+    Runner -. "initialize" .-> CE
+```
+
 Ray 是一个统计计算框架，旨在实现简单地从单机到大型分布式集群的扩展，提供构建和运行分布式应用的底层基础设置和一组核心原语。
 Ray Task 是 Ray 中最基本的计算单元，代表一个无状态的远程函数。Ray Task的每次执行都是独立的，不保留之前的任何信息。就像调用一个普通函数，执行完就清除内部状态。我们调用一个 Ray Task 后，会立即返回得到一个Ray ObjectRef，而不是实际的结果。主程序可以继续执行其他操作，而 Ray Task 则在后台并行运行。我们需要使用ray.get() 来获取Task的实际结果。Ray Task非常适合并行执行大量独立、一次性的计算任务，譬如数据批处理、独立的模型推理等场景。
 
@@ -100,8 +132,39 @@ FullyAsyncRunner 初始化 `FullyAsyncTrainer` 和 `FullyAsyncRollouter`: Traine
 
 Trainer 和 Rollouter 创建完成之后，`fully_async_main.py` 会进一步建立两条关键通信路径。第一条是 sample data path: 创建一个共享的 `MessageQueue`，并把同一个 `MessageQueueClient` 注入 Trainer 和 Rollouter。
 
+
 ## FullyAsyncRollouter
 
+FullyAsyncRollouter的数据流如下：
+```mermaid
+sequenceDiagram
+    autonumber
+
+    participant R as FullyAsyncRollouter
+    participant PQ as pending_queue
+    participant ALM as FullyAsyncAgentLoopManager
+    participant V as vLLM Replica
+    participant MQ as MessageQueue
+
+    loop Feed new rollout requests
+        R->>R: _feed_samples()
+        R->>PQ: put(RolloutSample)
+    end
+
+    loop Process rollout concurrently
+        R->>PQ: get()
+        PQ-->>R: RolloutSample
+
+        R->>R: _processor_worker()
+        R->>ALM: generate_sequences_single()
+
+        ALM->>V: generate(prompt)
+        V-->>ALM: generated tokens + log_probs
+
+        ALM-->>R: DataProto
+        R->>MQ: put_sample(RolloutSample)
+    end
+```
 > [!TIP]
 > **Producer-Consumer**
 >
@@ -112,81 +175,14 @@ Trainer 和 Rollouter 创建完成之后，`fully_async_main.py` 会进一步建
 > - **Consumer**：负责从缓冲区取出数据进行处理。如果缓冲区空了，消费者必须等待。
 > - **Buffer**：平滑了生产和消费的速率波动，允许两者并行工作，互不阻塞。
 
-`FullyAsyncRollouter` 是 Fully Async 架构中的 Producer，负责从训练数据中不断取出 prompt, 提交给异步 rollout engine 生成 response, 然后把完整的 rollout sample 写入 `MessageQueue`, 供另一边的 `FullyAsyncTrainer` 消费。它本身是一个 Ray Actor:
 
 
 
 ## FullyAsyncTrainer
 
-## Update weights
+## MessageQueue
 
 
-```mermaid
-sequenceDiagram
-    autonumber
-
-    participant Main as FullyAsyncTaskRunner
-    participant R as FullyAsyncRollouter
-    participant MQ as MessageQueue
-    participant ALM as FullyAsyncAgentLoopManager
-    participant V as vLLM Rollout Replica
-    participant T as FullyAsyncTrainer
-    participant CE as CheckpointEngineManager
-
-    Main->>R: fit.remote()
-    Main->>T: fit.remote()
-
-    par Rollout Pipeline
-        loop Continuous rollout generation
-            R->>R: _feed_samples()
-            R->>R: pending_queue.put(RolloutSample)
-
-            R->>R: _processor_worker()
-            R->>R: create active_task
-
-            R->>ALM: generate_sequences_single()
-            ALM->>V: generate(prompt)
-
-            V-->>ALM: generated tokens + rollout_log_probs
-            ALM-->>R: DataProto
-
-            R->>MQ: put_sample(RolloutSample)
-        end
-
-    and Training Pipeline
-        loop Every training micro-step
-            loop Collect required_samples
-                T->>MQ: get_sample()
-                MQ-->>T: RolloutSample
-            end
-
-            T->>T: assemble_batch_from_rollout_samples()
-            T->>T: _fit_compute_reward()
-            T->>T: _fit_compute_log_prob()
-            T->>T: _fit_compute_ref_log_prob()
-            T->>T: _fit_compute_advantage()
-            T->>T: _fit_update_actor()
-            T->>T: _fit_update_local_step()
-        end
-    end
-
-    Note over T: After trigger_parameter_sync_step local updates
-
-    T->>CE: update_weights(current_param_version)
-    CE->>V: abort in-flight requests
-    CE->>V: release KV cache
-    CE->>V: NCCL broadcast new weights
-    CE->>V: update vLLM weights
-    CE->>V: resume KV cache
-    CE->>V: resume generation
-
-    Note over R,V: partial_rollout=True:<br/>aborted rollout can continue with new model version
-
-    T->>R: reset_staleness()
-    R-->>T: rollout statistics
-
-    Note over R,T: Rollouter and Trainer continue concurrently
-```
 
 ```mermaid
 sequenceDiagram
