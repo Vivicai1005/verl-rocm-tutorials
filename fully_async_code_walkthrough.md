@@ -1,6 +1,8 @@
 # 深入 verl Fully Async Training：从架构原理到 AMD ROCm 上的 DAPO 训练实践
 
-从 `dapo_7b_math_fsdp2_4_4.sh`去理解verl fully async的工作流
+我们从 [dapo_7b_math_fsdp2_4_4.sh](https://github.com/Vivicai1005/verl/blob/main/verl/experimental/fully_async_policy/shell/dapo_7b_math_fsdp2_4_4.sh)出发，沿着实际代码调用链去分析verl Fully Async Training的工作流程，并进一步理解rollout, training, sample queue 以及 parameter synchronization 是如何解耦并异步运行的。
+
+整体调用链可以先概括为：
 ```mermaid
 flowchart TD
     A["dapo_7b_math_fsdp2_4_4.sh"]
@@ -18,50 +20,34 @@ flowchart TD
     F1 --> F11["Training GPUs"]
 
     F --> F2["FullyAsyncRollouter"]
-    F2 --> F21["vLLM Rollout GPUs"]
+    F2 --> F21["Rollout GPUs / vLLM"]
 
     F --> F3["MessageQueue"]
-
-    F --> F4["CheckpointEngineManager"]
-    F4 --> F41["NCCL weight sync"]
 
     E --> G["_run_training_loop()"]
 
     G --> R["FullyAsyncRollouter.fit()<br/><b>PRODUCER</b>"]
     G --> T["FullyAsyncTrainer.fit()<br/><b>CONSUMER</b>"]
 
-    R --> R1["generate sample"]
+    R --> R1["Generate Rollout Samples"]
+
     R1 --> MQ["MessageQueue"]
 
-    MQ --> T1["get sample from MQ"]
+    MQ --> T1["Fetch Training Samples"]
 
     T --> T1
-    T1 --> T2["assemble batch"]
-    T2 --> T3["reward / logprob"]
-    T3 --> T4["advantage"]
-    T4 --> T5["actor update"]
 
-    T5 -->|"every 4 local steps"| T6["NCCL parameter sync"]
-    T6 --> T7["Rollouter new version"]
+    T1 --> T2["Assemble Training Batch"]
 
-    T7 -.-> R
-```
+    T2 --> T3["Reward / Log Prob"]
 
-## FullyAsyncTaskRunner
-```
-dapo_7b_math_fsdp2_4_4.sh
-        │
-        ▼
-python -m verl.experimental.fully_async_policy.fully_async_main
-        │
-        ▼
-main(config)
-        │
-        ▼
-run_ppo(config, FullyAsyncTaskRunner)
-        │
-        ▼
-FullyAsyncTaskRunner.run(config)
+    T3 --> T4["Advantage"]
+
+    T4 --> T5["Policy Update"]
+
+    T5 --> T6["Parameter Synchronization"]
+
+    T6 -.->|"New Policy Version"| R
 ```
 <details>
 <summary>fully_async_main.py中main()代码</summary>
@@ -88,51 +74,34 @@ def main(config):
 ```
 </details>
 
-```mermaid
-flowchart TB
-
-    Runner["FullyAsyncTaskRunner<br/>Orchestrator"]
-
-    subgraph AsyncSystem["Fully Async Training System"]
-        direction TB
-
-        subgraph SampleFlow["Rollout Sample Path"]
-            direction LR
-
-            R["FullyAsyncRollouter<br/>Producer"]
-            MQ["MessageQueue<br/>Buffer"]
-            T["FullyAsyncTrainer<br/>Consumer"]
-
-            R -->|"Rollout Samples"| MQ
-            MQ -->|"Training Samples"| T
-        end
-
-        subgraph WeightFlow["Policy Weight Sync Path"]
-            direction RL
-
-            V["vLLM Rollout Replicas"]
-            CE["CheckpointEngineManager"]
-
-            CE -->|"Sync Weights"| V
-        end
-
-        SampleFlow -->|"Updated Policy"| WeightFlow
-    end
-
-    Runner -. "initialize & orchestrate" .-> AsyncSystem
+## FullyAsyncTaskRunner
+### `run_ppo`：启动 FullyAsyncTaskRunner
+`fully_async_main.main()` 主要完成 Hydra 配置加载、device 配置以及部分 rollout 配置迁移，通过：
+```python
+run_ppo(config, task_runner_class=FullyAsyncTaskRunner)
 ```
+启动 `FullyAsyncTaskRunner`。因此，如果把前面的 `main()` 看作 Fully Async Training 的入口，那么 `FullyAsyncTaskRunner` 就是整个 Fully Async 系统的顶层调度器。
 
-Ray 是一个统计计算框架，旨在实现简单地从单机到大型分布式集群的扩展，提供构建和运行分布式应用的底层基础设置和一组核心原语。
-Ray Task 是 Ray 中最基本的计算单元，代表一个无状态的远程函数。Ray Task的每次执行都是独立的，不保留之前的任何信息。就像调用一个普通函数，执行完就清除内部状态。我们调用一个 Ray Task 后，会立即返回得到一个Ray ObjectRef，而不是实际的结果。主程序可以继续执行其他操作，而 Ray Task 则在后台并行运行。我们需要使用ray.get() 来获取Task的实际结果。Ray Task非常适合并行执行大量独立、一次性的计算任务，譬如数据批处理、独立的模型推理等场景。
-
-Fully Async的初始化主要由 `FullyAsyncTaskRunner._initialize_components()` 完成。 `main()`首先通过Hydra加载并合并训练配置，设置运行设备，然后调用通用的`run_ppo()` 初始化Ray,并启动一个 `FullyAsyncTaskRunner` Ray Actor,; TaskRunner 随后负责真正构建 Fully Async 训练系统。 
-
-FullyAsyncRunner 初始化 `FullyAsyncTrainer` 和 `FullyAsyncRollouter`: Trainer 管理 Actor, Reference 等训练侧 Worker, 并负责消费rollout sample, 计算 advantage 和更新 policy; Rollouter 管理独立的 rollout GPU 和异步推理引擎，负责持续生成 trajectory。初始化 Trainer 前，会先通过 `create_role_worker_mapping()` 确定不同 Role 对应的 Worker 类型和 WorkerGroup 实现，并通过 ResourcePool 将 Trainer 的 Worker 分配到对应的 GPU 资源上。
-
-Trainer 和 Rollouter 创建完成之后，`fully_async_main.py` 会进一步建立两条关键通信路径。第一条是 sample data path: 创建一个共享的 `MessageQueue`，并把同一个 `MessageQueueClient` 注入 Trainer 和 Rollouter。
-
+### `FullyAsyncTaskRunner.run()`
+```python
+def run(self, config):
+    self._initialize_components(config)
+    self._run_training_loop()
+```
+整个Fully Async 系统分成两个阶段:
+(1) `__initialize_components()`: 负责创建Trainer, Rollouter, AgentLoopManager, vLLM Replicas, MessageQueue, Checkpoint Manager。
+(2) `_run_training_loop()`: Rollouter.fit() 和 Trainer.fit()
 
 ## FullyAsyncRollouter
+在FullyAsyncTaskRunner `_initialize_components()` 中的 `_create_rollouter` 创建 Rollouter
+```python
+rollouter = FullyAsyncRollouter.remote(
+    config=config,
+    tokenizer=self.components["tokenizer"],
+    processor=self.components["processor"],
+    device_name=config.trainer.device,
+)
+```
 
 FullyAsyncRollouter的数据流如下：
 ```mermaid
@@ -164,6 +133,8 @@ sequenceDiagram
         R->>MQ: put_sample(RolloutSample)
     end
 ```
+
+
 > [!TIP]
 > **Producer-Consumer**
 >
@@ -174,9 +145,37 @@ sequenceDiagram
 > - **Consumer**：负责从缓冲区取出数据进行处理。如果缓冲区空了，消费者必须等待。
 > - **Buffer**：平滑了生产和消费的速率波动，允许两者并行工作，互不阻塞。
 
-`FullyAsyncRollouter` 是 Fully Async Training 中的 rollout producer。它持续从训练数据集中读取prompt，将rollout request放入内部 `pending queue`
+`FullyAsyncRollouter` 是 Fully Async Training 中的 rollout producer。它持续从训练数据集中读取prompt，将 rollout request 放入内部 `pending_queue`，随后由独立的 processor coroutine 从 `pending_queue` 中读取这些 request，并异步提交给 rollout inference engine。
 
+### Init
+(1) 校验 Fully Async 配置
+```python
+assert not self.hybrid_engine
+assert self.config.data.train_batch_size == 0
+assert self.config.data.gen_batch_size == 1
+assert self.config.async_training.staleness_threshold >= 0
+assert self.config.async_training.trigger_parameter_sync_step >= 1
+```
+Fully Async Rollouter 以 single sample 为单位不断提交 rollout，而不是先组织完整 rollout batch 再统一生成。
 
+(2) 创建 Dataset 和 DataLoader
+Fully Async 架构中 Rollouter 自己维护 rollout 数据源。
+```python
+train_dataset = create_rl_dataset(...)
+val_dataset = create_rl_dataset(...)
+train_sampler = create_rl_sampler(...)
+...
+self._create_dataloader(
+    train_dataset,
+    val_dataset,
+    collate_fn,
+    train_sampler,
+)
+```
+
+### pending_queue
+### FullyAsyncAgentLoopManager
+### LLMServer
 
 ## FullyAsyncTrainer
 
