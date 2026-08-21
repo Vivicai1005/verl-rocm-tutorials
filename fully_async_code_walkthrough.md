@@ -1,5 +1,16 @@
 # 深入 verl Fully Async Training：从架构原理到 AMD ROCm 上的 DAPO 训练实践
 
+> [!TIP]
+> **Producer-Consumer**
+>
+> 生产者-消费者模式 （Producer-Consumer Pattern） 是一种经典的并发设计模式，用于解决两个处理速率不一致的组件之间的数据传输问题。
+>
+> - **核心思想**：生产者 （Producer） 和消费者 （Consumer）并不直接通信，而是通过一个 缓冲区 （Buffer/Queue）进行解耦。
+> - **Producer**：负责生成数据，并将其放入缓冲区。如果缓冲区满了，生产者必须等待或丢弃数据。
+> - **Consumer**：负责从缓冲区取出数据进行处理。如果缓冲区空了，消费者必须等待。
+> - **Buffer**：平滑了生产和消费的速率波动，允许两者并行工作，互不阻塞。
+
+
 我们从 [dapo_7b_math_fsdp2_4_4.sh](https://github.com/Vivicai1005/verl/blob/main/verl/experimental/fully_async_policy/shell/dapo_7b_math_fsdp2_4_4.sh)出发，沿着实际代码调用链去分析verl Fully Async Training的工作流程，并进一步理解rollout, training, sample queue 以及 parameter synchronization 是如何解耦并异步运行的。
 
 整体调用链可以先概括为：
@@ -45,7 +56,7 @@ flowchart TD
 
     T4 --> T5["Policy Update"]
 
-    T5 --> T6["Parameter Synchronization"]
+    T5 --> T6["CheckpointEngineManager"]
 
     T6 -.->|"New Policy Version"| R
 ```
@@ -76,11 +87,13 @@ def main(config):
 
 ## FullyAsyncTaskRunner
 ### `run_ppo`：启动 FullyAsyncTaskRunner
-`fully_async_main.main()` 主要完成 Hydra 配置加载、device 配置以及部分 rollout 配置迁移，通过：
+`fully_async_main.main()` 主要负责 Hydra 配置加载、device 配置以及部分 rollout 配置迁移，并通过：
 ```python
 run_ppo(config, task_runner_class=FullyAsyncTaskRunner)
 ```
-启动 `FullyAsyncTaskRunner`。因此，如果把前面的 `main()` 看作 Fully Async Training 的入口，那么 `FullyAsyncTaskRunner` 就是整个 Fully Async 系统的顶层调度器。
+将训练流程交给 `FullyAsyncTaskRunner`。
+
+`run_ppo()` 首先初始化 Ray runtime, 然后创建并启动`FullyAsyncTaskRunner`。
 
 ### `FullyAsyncTaskRunner.run()`
 ```python
@@ -88,9 +101,14 @@ def run(self, config):
     self._initialize_components(config)
     self._run_training_loop()
 ```
+
 整个Fully Async 系统分成两个阶段:
-(1) `__initialize_components()`: 负责创建Trainer, Rollouter, AgentLoopManager, vLLM Replicas, MessageQueue, Checkpoint Manager。
-(2) `_run_training_loop()`: Rollouter.fit() 和 Trainer.fit()
+
+(1) `_initialize_components()`: 创建并连接 Trainer, Rollouter, MessageQueue 等核心组件，完成 Fully Async Training 系统的初始化。
+
+(2) `_run_training_loop()`: 并发启动 rollouter.fit() 和 trainer.fit(), 让 rollout generation 与 policy training 持续异步执行。Rollouter 通过 `MessageQueue` 向 Trainer 传递 rollout samples; Trainer 更新 policy 后，则通过 `CheckpointEngineManager` 将最新的 policy weights 同步到 rollout replicas。
+
+下面我们将围绕 rollout sample flow 和 policy parameter synchronization，进一步介绍各个核心组件，以及它们是如何协同完成 Fully Async Training 的。
 
 ## FullyAsyncRollouter
 在FullyAsyncTaskRunner `_initialize_components()` 中的 `_create_rollouter` 创建 Rollouter
@@ -103,7 +121,9 @@ rollouter = FullyAsyncRollouter.remote(
 )
 ```
 
-FullyAsyncRollouter的数据流如下：
+`FullyAsyncRollouter` 是 Fully Async Training 中的 rollout producer。它独立维护 rollout 数据源，持续读取 prompt，并以 single sample 的方式提交给 rollout inference engine。 完成 generation 后的 `RolloutSample` 随后被写入 `MessageQueue`，供 `FullyAsyncTrainer` 异步消费。
+
+`FullyAsyncRollouter` 的主要数据流可以概括为：
 ```mermaid
 sequenceDiagram
     autonumber
@@ -111,10 +131,14 @@ sequenceDiagram
     participant R as FullyAsyncRollouter
     participant PQ as pending_queue
     participant ALM as FullyAsyncAgentLoopManager
-    participant V as vLLM Replica
+    participant SM as FullyAsyncLLMServerManager
+    participant V as vLLM Rollout Replica
     participant MQ as MessageQueue
 
-    loop Feed new rollout requests
+    Note over SM,V: create / manage<br/>rollout replicas
+    Note over ALM,SM: provide<br/>LLM client
+
+    loop Feed rollout samples
         R->>R: _feed_samples()
         R->>PQ: put(RolloutSample)
     end
@@ -123,31 +147,21 @@ sequenceDiagram
         R->>PQ: get()
         PQ-->>R: RolloutSample
 
-        R->>R: _processor_worker()
+        R->>R: create async generation task
         R->>ALM: generate_sequences_single()
 
-        ALM->>V: generate(prompt)
-        V-->>ALM: generated tokens + log_probs
+        ALM->>V: generate via AgentLoop Worker + LLM Client
+        V-->>ALM: generated result
 
         ALM-->>R: DataProto
         R->>MQ: put_sample(RolloutSample)
     end
 ```
 
-
-> [!TIP]
-> **Producer-Consumer**
->
-> 生产者-消费者模式 （Producer-Consumer Pattern） 是一种经典的并发设计模式，用于解决两个处理速率不一致的组件之间的数据传输问题。
->
-> - **核心思想**：生产者 （Producer） 和消费者 （Consumer）并不直接通信，而是通过一个 缓冲区 （Buffer/Queue）进行解耦。
-> - **Producer**：负责生成数据，并将其放入缓冲区。如果缓冲区满了，生产者必须等待或丢弃数据。
-> - **Consumer**：负责从缓冲区取出数据进行处理。如果缓冲区空了，消费者必须等待。
-> - **Buffer**：平滑了生产和消费的速率波动，允许两者并行工作，互不阻塞。
-
 `FullyAsyncRollouter` 是 Fully Async Training 中的 rollout producer。它持续从训练数据集中读取prompt，将 rollout request 放入内部 `pending_queue`，随后由独立的 processor coroutine 从 `pending_queue` 中读取这些 request，并异步提交给 rollout inference engine。
 
-### Init
+### FullyAsyncRollouter.__init__()
+`__init__()` 主要完成 Rollouter 自身的数据源、异步状态以及并发控制参数的初始化。。
 (1) 校验 Fully Async 配置
 ```python
 assert not self.hybrid_engine
@@ -156,6 +170,7 @@ assert self.config.data.gen_batch_size == 1
 assert self.config.async_training.staleness_threshold >= 0
 assert self.config.async_training.trigger_parameter_sync_step >= 1
 ```
+从 `self.config.data.gen_batch_size == 1` 里可以看出
 Fully Async Rollouter 以 single sample 为单位不断提交 rollout，而不是先组织完整 rollout batch 再统一生成。
 
 (2) 创建 Dataset 和 DataLoader
@@ -163,71 +178,97 @@ Fully Async 架构中 Rollouter 自己维护 rollout 数据源。
 ```python
 train_dataset = create_rl_dataset(...)
 val_dataset = create_rl_dataset(...)
+
 train_sampler = create_rl_sampler(...)
-...
+
 self._create_dataloader(
     train_dataset,
     val_dataset,
     collate_fn,
     train_sampler,
 )
+
+self.total_rollout_steps = (
+    len(self.train_dataloader)
+    * self.config.trainer.total_epochs
+)
 ```
 
-### pending_queue
-### FullyAsyncAgentLoopManager
-### LLMServer
+(3) pending_queue 和 active_tasks
+Rollouter 内部初始化了两个非常重要的异步状态：
+```python
+self.pending_queue = asyncio.Queue(maxsize=128)
+self.active_tasks = set()
+```
+
+其中，`pending_queue` 是 `FullyAsyncRollouter` 内部用于连接 sample 生产 和 rollout generation 执行的异步缓冲队列， 最大可以暂存128个未被 processor 取走的 `RolloutSample`，它解耦了 sample feeding 与 rollout generation。而 `active_tasks` 则用于管理实际执行中并发的 rollout requests。
+
+```
+Dataset
+   │
+   ▼
+pending_queue
+   │
+   │ _processor_worker() 取出
+   ▼
+active_tasks
+   │
+   ▼
+AgentLoop / vLLM
+```
+
+### FullyAsyncRollouter.init_workers()
+`FullyAsyncRollouter` 创建完成后，`FullyAsyncTaskRunner._create_rollouter()` 会调用 
+```python
+ray.get(rollouter.init_workers.remote())
+```
+在 `init_workers` 中 通过 `_init_async_rollout_manager` 创建两个核心组件：
+
+```python
+self.llm_server_manager = await FullyAsyncLLMServerManager.create(...)
+self.async_rollout_manager = await FullyAsyncAgentLoopManager.create( config=self.config, llm_client=self.llm_server_manager.get_client(...), ... )
+```
+
+#### FullyAsyncLLMServerManager
+`FullyAsyncLLMServerManager` 负责管理底层 rollout inference servers / replicas。比如在这个训练脚本中，它创建和维护 vLLM rollout replicas，并向上层提供 LLM client，使 AgentLoop 不需要直接感知具体的 replica。
+```
+FullyAsyncLLMServerManager
+        │
+        ├── create → vLLM Rollout Replicas
+        │
+        ├── create → GlobalRequestLoadBalancer
+        │
+        └── get_client()
+                    │
+                    ▼
+          FullyAsyncLLMServerClient
+```
+
+#### FullyAsyncAgentLoopManager
+`FullyAsyncAgentLoopManager` 位于 `FullyAsyncRollouter` 和 底层 rollout inference engine 之间。Rollouter 将 single sample request 提交给它，它选择一个 AgentLoop Worker 执行 generation；AgentLoop Worker 再通过 LLM client 将请求发送到底层 vLLM replica。
+
+```
+FullyAsyncRollouter
+        │
+        │ generate_sequences_single()
+        ▼
+FullyAsyncAgentLoopManager
+        │
+        ▼
+AgentLoop Worker
+        │
+        │ LLM Client
+        ▼
+FullyAsyncLLMServerManager
+        │
+        ▼
+vLLM Replica
+```
+
+### FullyAsyncRollouter.fit()
 
 ## FullyAsyncTrainer
 
 ## MessageQueue
 
 
-
-```mermaid
-sequenceDiagram
-    autonumber
-
-    participant D as Dataset
-    participant R as Rollouter<br/>4 GPUs / vLLM
-    participant MQ as MessageQueue
-    participant T as Trainer<br/>4 GPUs / FSDP2
-    participant CE as NCCL CheckpointEngine
-
-    loop Fully Async Execution
-
-        par Rollout continuously produces samples
-            D->>R: 1 prompt
-            Note over R: repeat n = 16
-            R->>R: Generate 16 responses
-            R->>MQ: Put 1 RolloutSample
-        and Trainer continuously consumes samples
-            loop Collect 128 RolloutSamples
-                T->>MQ: get_sample()
-                MQ-->>T: RolloutSample
-            end
-
-            Note over T: 128 prompt groups × 16 responses<br/>= 2048 trajectories
-
-            T->>T: Assemble training batch
-            T->>T: Reward
-            T->>T: Log Prob
-            T->>T: Advantage
-            T->>T: Actor Update
-        end
-
-        Note over T: local_trigger_step += 1
-
-        alt local_trigger_step == 4
-            T->>T: current_param_version += 1
-
-            T->>CE: Synchronize parameters
-            CE->>R: Abort active generation
-            CE->>R: NCCL broadcast weights
-            CE->>R: Resume generation
-
-            Note over R: partial_rollout=True<br/>unfinished responses continue
-
-            T->>R: reset_staleness()
-        end
-    end
-```
