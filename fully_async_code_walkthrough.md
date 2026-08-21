@@ -161,7 +161,8 @@ sequenceDiagram
 `FullyAsyncRollouter` 是 Fully Async Training 中的 rollout producer。它持续从训练数据集中读取prompt，将 rollout request 放入内部 `pending_queue`，随后由独立的 processor coroutine 从 `pending_queue` 中读取这些 request，并异步提交给 rollout inference engine。
 
 ### FullyAsyncRollouter.__init__()
-`__init__()` 主要完成 Rollouter 自身的数据源、异步状态以及并发控制参数的初始化。。
+`__init__()` 主要完成 Rollouter 自身的数据源、异步状态以及并发控制参数的初始化。
+
 (1) 校验 Fully Async 配置
 ```python
 assert not self.hybrid_engine
@@ -250,22 +251,93 @@ FullyAsyncLLMServerManager
 ```
 FullyAsyncRollouter
         │
-        │ generate_sequences_single()
         ▼
 FullyAsyncAgentLoopManager
         │
         ▼
 AgentLoop Worker
         │
-        │ LLM Client
         ▼
-FullyAsyncLLMServerManager
+FullyAsyncLLMServerClient
         │
         ▼
-vLLM Replica
+GlobalRequestLoadBalancer
+        │
+        ▼
+vLLM Rollout Replica
 ```
 
 ### FullyAsyncRollouter.fit()
+前面的 `__init__()` 和 `init_workers()` 完成了 Rollouter 的自身状态以及 rollout inference infrastructure 的初始化。真正开始生成 rollout samples， 则从 `FullyAsyncRollouter.fit()` 开始。
+在 `fit()`中启动
+```python
+generation_task = safe_create_task(
+    self._streaming_generation_main(),
+    name="generation_task",
+)
+
+monitor_task = safe_create_task(
+    self._async_monitor_loop(),
+    name="monitor_task",
+)
+```
+
+(1) `_feed_samples()`：从 Dataset 产生 `RolloutSample`
+`_feed_samples()` 持续遍历 trainer_dataloader， 以 single sample 为单位不断向 `pending_queue` 中提交 rollout request。
+```python
+for epoch, batch_dict in continuous_iterator:
+    full_batch = prepare_single_generation_data(
+        batch_dict,
+        self.config,
+    )
+
+    rollout_sample = RolloutSample(
+        full_batch=full_batch,
+        sample_id=sample_id,
+        epoch=epoch,
+        rollout_status={},
+    )
+
+    await self.pending_queue.put(rollout_sample)
+```
+
+（2）`_processor_worker()`：从 pending_queue 取出 sample
+`_processor_worker()` 持续从 `pending_queue` 中读取 rollout sample。
+```python
+rollout_sample = await self.pending_queue.get()
+self.pending_queue.task_done()
+```
+但并不会直接同步执行完整的generation，而是为这个 sample 创建一个独立的 async task。所以数据流从 ```pending_queue``` 进入 ```active_tasks```。
+```python
+task = safe_create_task(
+    self._process_single_sample_streaming(rollout_sample),
+    name=rollout_sample.sample_id,
+    task_set=self.active_tasks,
+)
+```
+`pending_queue` 保存的是等待被提交 generation 的 samples，而 `active_task` 保存的是已经提交、正在执行 generation 的 tasks。
+
+（3）`_process_single_sample_streaming()`：提交给AgentLoop
+
+（4）`FullyAsyncAgentLoopMageger`：将 request 送到 rollout replica
+`FullyAsyncAgentLoopManager.generate_sequences_single()` 会选择一个 AgentLoop Wokrer。
+```python
+worker = self._select_best_worker()
+
+output_future = worker.generate_sequences.remote(prompts)
+```
+AgentLoop Worker 再通过 `FullyAsyncLLMServerClient` 将 generation request 路由到具体的 vLLM replica。
+
+（5）vLLM 返回 generation result
+vLLM 完成 inference 后， generated tokens, log probs 等信息最终被 AgentLoop 整理 为 DataProto 返回。然后回答：
+```python
+_process_single_sample_streaming()
+```
+中
+```python
+rollout_sample.full_batch = ret
+```
+于是原本只包含 prompt 等输入信息的 `RolloutSample`，现在已经包含完成 generation 后的 rollout 数据。
 
 ## FullyAsyncTrainer
 
