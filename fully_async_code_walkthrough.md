@@ -340,6 +340,49 @@ rollout_sample.full_batch = ret
 于是原本只包含 prompt 等输入信息的 `RolloutSample`，现在已经包含完成 generation 后的 rollout 数据。
 
 ## FullyAsyncTrainer
+在`FullyAsyncTaskRunner._initialize_components()` 中的 `_create_trainer()` 创建 Trainer：
+```python
+trainer = FullyAsyncTrainer.remote(
+            config=config,
+            tokenizer=self.components["tokenizer"],
+            role_worker_mapping=trainer_role_mapping,
+            resource_pool_manager=create_resource_pool_manager(config, roles=list(trainer_role_mapping.keys())),
+            ray_worker_group_cls=self.components["ray_worker_group_cls"],
+            device_name=config.trainer.device,
+        )
+```
+`FullyAsyncTrainer` 是 Fully Async Training 中的 training consumer。它持续从 `MessageQueue` 中获取 Rollouter 已经生成完成的 `RolloutSample`，收集足够数量的 samples 后组装成 training batch，随后完成 reward、log probability、advantage 计算以及 policy update。
+
+Policy 更新到一定步数后，Trainer 再通过 `CheckpointEngineManager` 将最新的 policy weights 同步到 rollout replicas，使 Rollouter 后续可以使用新的 policy parameter version 继续生成 samples。
+
+`FullyAsyncTrainer` 的主要数据流可以概括为：
+```mermaid
+sequenceDiagram
+    autonumber
+
+    participant MQ as MessageQueue
+    participant T as FullyAsyncTrainer
+    participant AW as Actor WorkerGroup
+    participant CE as CheckpointEngineManager
+    participant V as vLLM Rollout Replicas
+
+    loop Consume rollout samples
+        T->>MQ: get_sample()
+        MQ-->>T: RolloutSample
+    end
+
+    T->>T: Assemble Training Batch
+    T->>T: Reward / Log Prob / Advantage
+
+    T->>AW: Update Policy
+    AW-->>T: Updated Policy
+
+    opt Reach Parameter Sync Step
+        T->>CE: update_weights()
+        CE->>V: Sync Latest Policy Weights
+    end
+```
+### FullyAsyncTrainer.init()
 
 ## MessageQueue
 
