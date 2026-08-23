@@ -1,15 +1,5 @@
 # 深入 verl Fully Async Training：从架构原理到 AMD ROCm 上的 DAPO 训练实践
 
-> [!TIP]
-> **Producer-Consumer**
->
-> 生产者-消费者模式 （Producer-Consumer Pattern） 是一种经典的并发设计模式，用于解决两个处理速率不一致的组件之间的数据传输问题。
->
-> - **核心思想**：生产者 （Producer） 和消费者 （Consumer）并不直接通信，而是通过一个 缓冲区 （Buffer/Queue）进行解耦。
-> - **Producer**：负责生成数据，并将其放入缓冲区。如果缓冲区满了，生产者必须等待或丢弃数据。
-> - **Consumer**：负责从缓冲区取出数据进行处理。如果缓冲区空了，消费者必须等待。
-> - **Buffer**：平滑了生产和消费的速率波动，允许两者并行工作，互不阻塞。
-
 
 我们从 [dapo_7b_math_fsdp2_4_4.sh](https://github.com/Vivicai1005/verl/blob/main/verl/experimental/fully_async_policy/shell/dapo_7b_math_fsdp2_4_4.sh)出发，沿着实际代码调用链去分析verl Fully Async Training的工作流程，并进一步理解rollout, training, sample queue 以及 parameter synchronization 是如何解耦并异步运行的。
 
@@ -383,7 +373,117 @@ sequenceDiagram
     end
 ```
 ### FullyAsyncTrainer.init()
+### FullyAsyncTrainer.init_workers()
+`FullyAsyncTrainer` 创建完成后，`FullyAsyncTaskRunner._create_trainer()` 会调用：
+```python
+ray.get(trainer.init_workers.remote())
+```
+`init_workers()` 负责创建 Trainer 端 真正执行 policy training 的 distributed workers：
+```python
+async def init_workers(self):
+    """Initialize distributed training workers using Ray backend.
+    Creates:
+    1. Ray resource pools from configuration
+    2. Worker groups for each role (actor, critic, etc.)
+    """
+    self._init_resource_pools()
+    self._create_worker_classes()
+    self._init_worker_groups()
+    self._init_models()
+```
+（1）_init_resource_pools()：准备 Training GPU 资源
+（2）_create_worker_classes()：确定需要创建哪些 Worker
+（3）_init_worker_groups()：创建 Ray WorkerGroup
+（4）_init_models()：得到 actor_`wg，actor_wg` 就是后续真正负责 policy training 的 Actor WorkerGroup。
 
-## MessageQueue
+## FullyAsyncTrainer.fit()
+前面的 __init__() 和 init_workers() 已经完成了 Trainer 自身状态以及 Training WorkerGroups 的初始化。真正开始消费 rollout samples 并执行 policy training，则从`FullyAsyncTrainer.fit()` 开始。
 
+### FullyAsyncTrainer.fit_step()
+`fit_step()` 才是 Fully Async Trainer 一次完整 training step 的核心数据流。
+主要流程可以简化成：
+```
+batch = await self._fit_generate(None)
+
+batch = self._fit_compute_reward(batch)
+batch = self._fit_compute_log_prob(batch)
+batch = self._fit_compute_ref_log_prob(batch)
+batch = self._fit_compute_critic(batch)
+batch = self._fit_compute_advantage(batch)
+
+batch = self._fit_update_critic(batch)
+batch = self._fit_update_actor(batch)
+
+self._fit_update_local_step()
+
+await self._fit_update_weights()
+```
+（1）`_fit_generate()`：从 `MessageQueue` 获取并组装 Training Batch
+虽然函数名字仍然叫 `_fit_generate()`，但在 Fully Async Trainer 中，这里并不会执行 rollout generation，而是进一步调用：
+```python
+epoch, batch = await self._get_samples_from_queue()
+```
+从 `MessageQueue` 中获取 Rollouter 已经生成完成的 `RolloutSample`。
+Trainer 会持续执行：
+```python
+sample, queue_len = await self.message_queue_client.get_sample()
+```
+直到收集到 `self.required_samples` 个 samples。
+收集完成后，Trainer 先将 MessageQueue 中序列化的数据恢复为 `RolloutSample`，然后把多个独立的 `RolloutSample` 组装成真正用于 PPO / GRPO training 的 `DataProto` batch。
+
+（2）Reward / Log Prob / Advantage
+Trainer 得到完整的 training batch 后，接下来需要把 rollout trajectory 转换成 policy update 所需要的训练信号：
+Reward 用来评价 rollout response 的好坏：
+```python
+batch = self._fit_compute_reward(batch)
+```
+计算得到的 reward 会被写回 training batch，作为后续 advantage calculation 的基础。
+接下来计算 policy probability 相关的信息：
+```python
+batch = self._fit_compute_log_prob(batch)
+batch = self._fit_compute_ref_log_prob(batch)
+```
+`log_prob` 描述生成这些 tokens 时 policy 对应的概率；`ref_log_prob` 描述 Reference Policy 对这些 tokens 的概率，用于需要 KL constraint 等场景。
+```python
+batch = self._fit_compute_advantage(batch)
+```
+根据 reward 等信息计算每条 response 的 advantage，也就是判断这个 response 相比其他 samples 表现得更好还是更差。
+在我们的 DAPO 训练中使用：
+```python
+algorithm.adv_estimator=grpo
+```
+因此主要使用 GRPO 的 group-relative reward 来计算 advantage，而不依赖 Critic value model。
+
+（3）_fit_update_actor()：更新 Policy
+完成 reward、log prob 和 advantage 计算后，Trainer 调用：
+```python
+batch = self._fit_update_actor(batch)
+```
+开始真正更新 Actor Policy。
+`_fit_update_actor()` 会使用当前 training batch 中的 response、log prob、advantage 等信息计算 policy loss，并通过前面 `init_workers()` 创建的 `actor_wg` 在 Training GPUs 上执行反向传播和 optimizer step。
+
+（4）_fit_update_weights()：同步最新 Policy
+`_fit_update_actor()` 更新的是 Training side 的 Actor weights。Rollout side 的 vLLM replicas 不会立即自动获得这些新参数，因此 Trainer 还需要通过：
+```python
+await self._fit_update_weights()
+```
+将最新 Policy 同步到 Rollout side。
+
+首先，_fit_update_weights() 会判断当前是否到达 parameter synchronization point：
+```python
+if self.local_trigger_step != 1: return None
+```
+`_fit_update_local_step()` 只有在完成 `trigger_parameter_sync_step` 个 training steps 后，才会：
+``python
+self.current_param_version += 1 self.local_trigger_step = 1
+```
+也就是说，Policy 可以连续更新多次，但只有完成一个 synchronization cycle 后才把最新版本发送给 Rollout side。
+
+真正的权重同步由下面的步骤完成：
+```python
+await self.checkpoint_manager.update_weights( global_steps=self.current_param_version, )
+```
+`CheckpointEngineManager` 使用 checkpoint engine 将 Trainer 中最新的 Actor weights 同步给 rollout replicas。
+
+## MessageQue
 
