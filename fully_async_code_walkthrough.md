@@ -100,6 +100,35 @@ def run(self, config):
 
 下面我们将围绕 rollout sample flow 和 policy parameter synchronization，进一步介绍各个核心组件，以及它们是如何协同完成 Fully Async Training 的。
 
+## MessageQueue
+在进入 `FullyAsyncRollouter` 和 `FullyAsyncTrainer` 的具体流程之前，我们先介绍连接两者的 MessageQueue。
+
+`FullyAsyncRollouter` 是 Producer，持续生成完成的 RolloutSample 并写入 `MessageQueue`；`FullyAsyncTrainer` 是 Consumer，从 `MessageQueue` 中持续获取 samples，并在收集到足够数量后组装成 training batch。
+
+因此 `MessageQueue` 本质上是 rollout generation 和 policy training 之间的异步 buffer，使 Rollouter 和 Trainer 可以按照各自的速度独立运行。
+
+### MessageQueue 的创建
+MessageQueue 由 FullyAsyncTaskRunner._initialize_components() 创建：
+```python
+max_queue_size = ray.get(
+    self.components["rollouter"].get_max_queue_size.remote()
+)
+
+message_queue = MessageQueue.remote(
+    config,
+    max_queue_size,
+)
+
+message_queue_client = MessageQueueClient(message_queue)
+```
+`MessageQueue` 是一个独立的 Ray Actor，而 Rollouter 和 Trainer 都通过 `MessageQueueClient` 与它通信。
+同一个 `MessageQueueClient` 被注入两边：
+```python
+ray.get( self.components["rollouter"] .set_message_queue_client.remote(message_queue_client) )
+ray.get( self.components["trainer"] .set_message_queue_client.remote(message_queue_client) )
+```
+这样，Rollouter 和 Trainer 就通过同一个 `MessageQueue` 建立了 sample 传递通道。下面先从 Producer 一侧开始，介绍 `FullyAsyncRollouter` 如何持续生成 rollout samples。
+
 ## FullyAsyncRollouter
 在FullyAsyncTaskRunner `_initialize_components()` 中的 `_create_rollouter` 创建 Rollouter
 ```python
@@ -484,6 +513,3 @@ self.current_param_version += 1 self.local_trigger_step = 1
 await self.checkpoint_manager.update_weights( global_steps=self.current_param_version, )
 ```
 `CheckpointEngineManager` 使用 checkpoint engine 将 Trainer 中最新的 Actor weights 同步给 rollout replicas。
-
-## MessageQue
-
