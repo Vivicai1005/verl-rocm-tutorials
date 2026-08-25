@@ -6,7 +6,7 @@ Fully Async Policy Training 的思路，是为 Rollout 和 Training 分配独立
 
 与此同时，最新的 Policy 参数会定期同步给 Rollouter，让样本生成、模型训练和参数同步尽可能重叠执行，从而减少等待时间并提高 GPU 利用率。
 
-接下来，我们将从 [dapo_7b_math_fsdp2_4_4.sh](https://github.com/verl-project/verl/blob/main/verl/experimental/fully_async_policy/shell/dapo_7b_math_fsdp2_4_4.sh)出发，沿着实际代码调用链去分析verl Fully Async Training的工作流程，并进一步理解rollout, training, sample queue 以及 parameter synchronization 是如何解耦并异步运行的。
+接下来，我们将从 [dapo_7b_math_fsdp2_4_4.sh](https://github.com/verl-project/verl/blob/main/verl/experimental/fully_async_policy/shell/dapo_7b_math_fsdp2_4_4.sh)出发，沿着实际代码调用链去分析verl Fully Async Policy Training的工作流程，并进一步理解rollout, training, sample queue 以及 parameter synchronization 是如何解耦并异步运行的。
 
 整体调用链可以先概括为：
 ```mermaid
@@ -64,7 +64,7 @@ def main(config):
 run_ppo(config, task_runner_class=FullyAsyncTaskRunner)
 ```
 
-`run_ppo()` 会初始化 Ray Runtime，并创建 FullyAsyncTaskRunner，随后调用它的 `run()` ，正式进入 Fully Async Policy Training 的初始化与执行流程。
+`run_ppo()` 会初始化 Ray Runtime，并创建 FullyAsyncTaskRunner，随后调用它的 `run()`方法 ，正式进入 Fully Async Policy Training 的初始化与执行流程。
 
 ### `FullyAsyncTaskRunner.run()`
 ```python
@@ -75,18 +75,18 @@ def run(self, config):
 
 整个Fully Async 系统的运行过程分成两个阶段:
 
-(1) `_initialize_components()`: 创建并连接 `FullyAsyncTrainer`、`FullyAsyncRollouter`、`MessageQueue`、`CheckpointEngineManager` 等核心组件，为后续的异步训练做好准备。
+(1) `_initialize_components()`: 创建 `FullyAsyncTrainer` 与 `FullyAsyncRollouter`，建立两者之间的引用关系，并创建共享的 `MessageQueue`。当 Rollouter 被注入 Trainer 时，Trainer 会在内部创建 `CheckpointEngineManager`，用于后续将 Actor 参数同步到 Rollout Replicas。
 
 (2) `_run_training_loop()`: 并发启动 Rollouter.fit() 和 Trainer.fit(), 让 Rollout Generation 与 Policy Training 持续异步执行。Rollouter 通过 `MessageQueue` 向 Trainer 传递 Rollout Samples; Trainer 更新 Policy 后，则通过 `CheckpointEngineManager` 将最新的 Policy Weights 同步到 Rollout Replicas。
 
-接下来，我们将顺着 Rollout Sample Flow 和 Policy Parameter Synchronization 这两条核心数据流，逐一介绍系统中的重要组件，看看它们是如何相互配合，让 Rollout 和 Training 异步运行起来的。
+接下来，我们将介绍系统中的核心组件，并沿着样本传递与参数同步流程，分析 Rollout Generation 和 Policy Training 如何异步运行。
 
 ## MessageQueue
-在深入 `FullyAsyncRollouter` 和 `FullyAsyncTrainer` 的具体流程之前，我们先来看看连接两者的 `MessageQueue`。
+在深入 `FullyAsyncRollouter` 和 `FullyAsyncTrainer` 的具体流程之前，我们先来看连接两者的 `MessageQueue`。
 
-在这套 Producer-Consumer 模型中，FullyAsyncRollouter 扮演 Producer 的角色：它持续生成完整的 RolloutSample，并将其写入 MessageQueue。FullyAsyncTrainer 则是 Consumer：它不断从队列中获取样本，在收集到足够数量后，将这些样本组装成 Training Batch，用于后续的 Policy 更新。
+在这套 Producer-Consumer 模型中，`FullyAsyncRollouter` 是 Producer，负责生成完整的 `RolloutSample` 并将其写入 `MessageQueue`；`FullyAsyncTrainer` 是 Consumer，负责逐个读取样本，并在收集到足够数量后将它们组装成 Training Batch，用于后续的 Policy Update。
 
-因此，`MessageQueue` 不只是一个传递样本的队列，它还是 Rollout Generation 与 Policy Training 之间的异步缓冲区。即使 Rollouter 和 Trainer 的处理速度不同，也不需要相互等待，而是可以按照各自的节奏持续运行。
+`MessageQueue` 作为 Rollout Generation 与 Policy Training 之间的异步缓冲区，可以协调两者处理速度上的差异，使 Rollouter 和 Trainer 按照各自的节奏运行。当队列中没有足够的样本时，Trainer 才需要等待 Rollouter 继续生成。
 
 ### MessageQueue 的创建
 `MessageQueue` 由 `FullyAsyncTaskRunner._initialize_components()` 创建：
@@ -103,17 +103,15 @@ message_queue = MessageQueue.remote(
 message_queue_client = MessageQueueClient(message_queue)
 ```
 `MessageQueue` 是一个独立的 Ray Actor，`MessageQueueClient` 则封装了与它通信的接口。
-创建完成后，指向同一个 `MessageQueue` 的 Client 会被注入 Rollouter 和 Trainer：：
+创建完成后，指向同一个 `MessageQueue` 的 Client 会被注入 Rollouter 和 Trainer:
 ```python
 ray.get( self.components["rollouter"] .set_message_queue_client.remote(message_queue_client) )
 ray.get( self.components["trainer"] .set_message_queue_client.remote(message_queue_client) )
 ```
-至此，Rollouter 和 Trainer 之间的样本传递通道就建立起来了。
-
-接下来，我们先从 Producer 一侧开始，看看 `FullyAsyncRollouter` 如何持续生成 Rollout Samples，并将它们写入 `MessageQueue`。
+至此，Rollouter 和 Trainer 之间的样本传递通道就建立起来了。接下来，我们先从 Producer 一侧开始，看看 `FullyAsyncRollouter` 如何持续生成 Rollout Samples，并将它们写入 `MessageQueue`。
 
 ## FullyAsyncRollouter
-在`FullyAsyncTaskRunner._initialize_components()` 中， `_create_rollouter` 会创建 `FullyAsyncRollouter`：
+在`FullyAsyncTaskRunner._initialize_components()` 中， `_create_rollouter` 会创建并初始化 `FullyAsyncRollouter`：
 ```python
 rollouter = FullyAsyncRollouter.remote(
     config=config,
@@ -121,15 +119,14 @@ rollouter = FullyAsyncRollouter.remote(
     processor=self.components["processor"],
     device_name=config.trainer.device,
 )
+
+ray.get(rollouter.init_workers.remote())
+ray.get(rollouter.set_max_required_samples.remote())
 ```
 
-`FullyAsyncRollouter` 是 Fully Async Policy Training 中的 Rollout Producer， 负责持续读取 Prompt，并以单个样本为粒度发起异步生成任务。
+`FullyAsyncRollouter` 是 Fully Async Policy Training 中的 Producer， 负责持续读取 Prompt，并以单个样本为粒度发起异步生成任务。
 
-它首先将等待生成的 `RolloutSample` 放入内部的 `pending_queue`。Processor Worker 从队列中取出样本并创建异步任务，再通过 `FullyAsyncAgentLoopManager` 将生成请求发送给 vLLM Rollout Replica。生成完成后，包含完整 Response 的 `RolloutSample` 会被写入 `MessageQueue`，等待 `FullyAsyncTrainer` 获取和消费。
-
-这里需要注意两个队列的区别：
-- `pending_queue` 是 Rollouter 内部的任务队列，用来保存等待执行生成任务的样本；
-- `MessageQueue` 位于 Rollouter 和 Trainer 之间，用来保存已经完成生成、可以用于训练的样本。
+它首先将待处理的 `RolloutSample` 放入内部的 `pending_queue`。随后，`_processor_worker()` 从队列中取出样本，为每个样本创建独立的异步生成任务，并通过 `FullyAsyncAgentLoopManager` 将请求发送给底层 vLLM Replica。Generation 和 Reward Calculation 完成后，Rollouter 再将完整的 `RolloutSample` 写入 `MessageQueue`。
 
 `FullyAsyncRollouter` 的主要数据流可以概括为：
 ```mermaid
@@ -159,10 +156,8 @@ sequenceDiagram
     end
 ```
 
-`pending_queu`e 将样本读取与生成任务解耦，使 Rollouter 可以一边准备新的样本，一边处理正在运行的生成任务。`MessageQueue` 则进一步将 Rollout Generation 与 Policy Training 解耦，让 Rollouter 在写入完整样本后继续生成，而不需要等待 Trainer 完成训练。
-
 ### FullyAsyncRollouter.__init__()
-`__init__()` 主要完成 Rollouter 自身的数据源、异步状态以及并发控制参数的初始化。
+`__init__()` 主要负责校验 Fully Async 配置，创建 Rollout 数据源，并初始化后续异步生成所需的状态。
 
 (1) 校验 Fully Async 配置
 ```python
@@ -172,11 +167,10 @@ assert self.config.data.gen_batch_size == 1
 assert self.config.async_training.staleness_threshold >= 0
 assert self.config.async_training.trigger_parameter_sync_step >= 1
 ```
-从 `self.config.data.gen_batch_size == 1` 里可以看出
-Fully Async Rollouter 以 single sample 为单位不断提交 rollout，而不是先组织完整 rollout batch 再统一生成。
+其中，`self.config.data.gen_batch_size == 1` 表明 Fully Async Rollouter 以 single sample 为单位不断提交 rollout，而不是先组织完整 rollout batch 再统一生成。
 
 (2) 创建 Dataset 和 DataLoader
-Fully Async 架构中 Rollouter 自己维护 rollout 数据源。
+Fully Async 架构中的训练数据由 Rollouter 读取，因为 Prompt 是在 Rollout 一侧被转换成训练样本的：
 ```python
 train_dataset = create_rl_dataset(...)
 val_dataset = create_rl_dataset(...)
@@ -189,63 +183,45 @@ self._create_dataloader(
     collate_fn,
     train_sampler,
 )
-
-self.total_rollout_steps = (
-    len(self.train_dataloader)
-    * self.config.trainer.total_epochs
-)
 ```
 
-(3) pending_queue 和 active_tasks
-Rollouter 内部初始化了两个非常重要的异步状态：
+(3) 初始化 pending_queue 和 active_tasks
+Rollouter 维护了两个重要的异步状态：
 ```python
 self.pending_queue = asyncio.Queue(maxsize=128)
 self.active_tasks = set()
 ```
-
-其中，`pending_queue` 保存等待提交 Generation 的 `RolloutSample`。而 `active_tasks` 则用于跟踪已经提交、正在运行的异步 Generation Tasks。
+`pending_queue` 保存等待提交 Generation 的 `RolloutSample`。 `active_tasks` 则用于跟踪已经提交、仍在执行的异步 Generation Tasks。
 
 ### FullyAsyncRollouter.init_workers()
 创建 Rollouter 后，`FullyAsyncTaskRunner._create_rollouter()` 会调用：
 ```python
 ray.get(rollouter.init_workers.remote())
 ```
-在 `init_workers` 中 通过 `_init_async_rollout_manager` 创建两个核心组件：
+`init_workers()` 会初始化异步状态，并创建 Reward 和 Rollout Generation 所需的基础组件：
 
 ```python
-self.llm_server_manager = await FullyAsyncLLMServerManager.create(...)
-self.async_rollout_manager = await FullyAsyncAgentLoopManager.create( config=self.config, llm_client=self.llm_server_manager.get_client(...), ... )
+async def init_workers(self):
+    self._init_async_objects()
+    self._create_worker_classes()
+    await self._create_reward_loop_manager()
+    await self._create_teacher_model_manager()
+    await self._init_async_rollout_manager()
+    SkipManager.init(self.config)
 ```
-它们的职责分别是：
-- `FullyAsyncLLMServerManager`: 创建和管理底层 Rollout Inference Servers。在当前训练配置中，它负责维护 vLLM Rollout Replicas 和 `GlobalRequestLoadBalancer`，并向上层提供统一的 LLM Client。
-- `FullyAsyncAgentLoopManager`: 连接 Rollouter 与底层 Rollout Pipeline。它选择一个 AgentLoop Worker 执行 Generation；AgentLoop Worker 通过 LLM Client 将请求路由到具体的 vLLM Replica，并在 Generation 完成后调用 RewardLoop Worker 计算 Reward。
+对于当前 DAPO Training，主要涉及以下三个组件：
+- `RewardLoopManager`: 创建并管理 RewardLoop Workers，负责计算答案得分和 Overlong Penalty；
+- `FullyAsyncLLMServerManager`: 创建和管理底层 Rollout Replicas，并通过 `GlobalRequestLoadBalancer` 将 Generation Request 路由到可用的 vLLM Server；
+- `FullyAsyncAgentLoopManager`: 把单个样本分发给 AgentLoop Worker。AgentLoop Worker 通过 LLM Client 完成 Generation，并在生成结束后调用 RewardLoop Worker 计算 Reward。
 
 ### FullyAsyncRollouter.fit()
-`__init__()` 和 `init_workers()` 完成了 Rollouter 自身状态、数据源以及 Rollout Inference Infrastructure 的初始化。真正的 Rollout Generation 从 `FullyAsyncRollouter.fit()` 开始。
-`fit()` 会同时启动两个异步任务：
-```python
-generation_task = safe_create_task(
-    self._streaming_generation_main(),
-    name="generation_task",
-)
+完成初始化后，`FullyAsyncRollouter.fit()` 会启动持续生成样本的异步流程。其中，`_feed_samples()` 负责从 `DataLoader` 读取 Prompt 并准备 `RolloutSample`，`_processor_worker()` 则负责提交异步 Generation Task。
 
-monitor_task = safe_create_task(
-    self._async_monitor_loop(),
-    name="monitor_task",
-)
-```
-其中，`generation_task` 负责持续生成 Rollout Trajectories，`monitor_task` 则定期检查运行状态，并在条件允许时恢复暂停的 Rollout。
-在 `_streaming_generation_main()` 中，还会进一步启动两个相互配合的 Coroutine：
-```python
-self.feed_task = safe_create_task( self._feed_samples(), name="feed_task", )
-self.processor_task = safe_create_task( self._processor_worker(), name="processor_task", )
-```
-
-接下来，我们沿着一个 `RolloutSample` 的数据流，看看 Rollouter 如何完成整个生成过程：
+接下来，我们沿着一个 `RolloutSample` 的数据流，看看它如何完成从 Prompt 读取、Response Generation、Reward Calculation 到写入 `MessageQueue` 的全过程。
 
 (1) train_dataloader → pending_queue
 
-`_feed_samples()` 持续遍历 train_dataloader，每次读取一个 Prompt，并创建对应的 RolloutSample：
+`_feed_samples()` 持续遍历 `train_dataloader`，每读取到一个 Prompt，就会通过 `prepare_single_generation_data()` 准备生成输入，并将其封装成 `RolloutSample`：
 ```python
 for epoch, batch_dict in continuous_iterator:
     full_batch = prepare_single_generation_data(
@@ -262,7 +238,7 @@ for epoch, batch_dict in continuous_iterator:
 
     await self.pending_queue.put(rollout_sample)
 ```
-此时，`RolloutSample.full_batch` 主要包含 Prompt 等生成输入。创建完成后，样本会被写入 `pending_queue`，等待 Processor 取出。
+此时，`RolloutSample.full_batch` 主要包含 Prompt 等生成输入，还没有 Response 和 Reward。样本会先进入 `pending_queue`，等待后续处理。
 
 (2) pending_queue → async generation task
 
@@ -279,56 +255,46 @@ task = safe_create_task(
     task_set=self.active_tasks,
 )
 ```
-这里并不是把 RolloutSample 放入 `active_tasks`，而是创建一个处理该样本的 Async Task，并通过 `active_tasks` 跟踪它的运行状态。
-因此，`pending_queue` 保存等待提交的 Samples，`active_tasks` 管理已经提交、正在运行的 Generation Tasks。
+创建出的任务会被加入 `active_tasks`，以便 Rollouter 跟踪当前正在运行的 Generation Tasks。
 
 (3) async generation task → AgentLoop → vLLM
 
-每个异步任务都会进入 `_process_single_sample_streaming()`，并将样本提交给 `FullyAsyncAgentLoopManager`：
+每个异步任务都会进入 `_process_single_sample_streaming()`，并将样本输入提交给 `FullyAsyncAgentLoopManager`：
 ```python
 ret = await self.async_rollout_manager.generate_sequences_single( rollout_sample.full_batch )
 ```
+
 `FullyAsyncAgentLoopManager.generate_sequences_single()` 会选择一个 AgentLoop Worker：
 ```python
 worker = self._select_best_worker()
 output_future = worker.generate_sequences.remote(prompts)
 ```
-AgentLoop Worker 再通过 `FullyAsyncLLMServerClient` 将 Generation Request 路由到具体的 vLLM Replica。
+AgentLoop Worker 随后通过 `FullyAsyncLLMServerClient` 将 Generation Request 路由到可用的 vLLM Replica。vLLM 完成推理后，会返回 Generated Tokens 和 Rollout Log Probabilities 等结果。
 
-(4) vLLM → completed RolloutSample → MessageQueue
+(4) vLLM → AgentLoop → RewardLoop Worker
 
-vLLM 完成推理后，Generated Tokens、Log Probabilities 等结果会被 AgentLoop Worker 整理成 `DataProto`，并返回给 Rollouter：
-```python
-rollout_sample.full_batch = ret
-```
-此时，原本主要包含 Prompt 输入的 `RolloutSample`，已经包含完整的生成结果，形成了一条可供后续训练使用的 Rollout Trajectory。
-随后，Rollouter 将这条 Trajectory 序列化并写入 MessageQueue：
-```python
-success = await self.message_queue_client.put_sample( sample=ray.cloudpickle.dumps(rollout_sample), )
-```
-
-(5) vLLM → RewardLoop Worker
-
-收到 vLLM 的生成结果后，AgentLoop Worker 会调用：
+收到 vLLM 返回的生成结果后，AgentLoop Worker 会完成 Response、Response Mask 和 Rollout Log Probabilities 等数据的整理。随后，它会选择一个 RewardLoop Worker 计算 Reward：
 ```python
 selected_reward_loop_worker_handle = random.choice( self.reward_loop_worker_handles )
+
 result = await selected_reward_loop_worker_handle.compute_score.remote( data )
 ```
-对于当前 DAPO Training，RewardLoop Worker 会使用 `DAPORewardManager`，根据生成的 Response 和 Ground Truth 计算基础 Reward，并根据配置加入 Overlong Penalty。随后，AgentLoop 会把每条 Response 的 Reward 写入 `rm_scores`。
 
-(6) RolloutSample → MessageQueue
+Reward 计算完成后，AgentLoop 会将结果整理到 `rm_scores` 等字段中，并与 Response、Response Mask 和 Rollout Log Probabilities 一起封装成完整的 `DataProto`。
 
-`AgentLoop` 返回完整的 `DataProto` 后，Rollouter 将它写回当前的 `RolloutSample：
+(5) RolloutSample → MessageQueue
+
+Rollouter 收到 AgentLoop 返回的 DataProto 后，会把它写回当前的 RolloutSample：
 ```python
 rollout_sample.full_batch = ret
 ```
-此时，一个 RolloutSample 通常包含同一个 Prompt 对应的一组完整 Rollout Trajectories。每条 Trajectory 都包含相应的 Response、Rollout Log Probabilities 和 Reward。
+到这里，这个 `RolloutSample` 已经包含完整的生成结果。它通常对应一个 Prompt，并包含该 Prompt 生成的多条 Rollout Trajectories。每条 Trajectory 都带有相应的 Response、Rollout Log Probabilities 和 Reward。
 
-最后，Rollouter 将这个 `RolloutSample` 序列化并写入 `MessageQueue`：
+最后，Rollouter 将 `RolloutSample` 序列化并写入 `MessageQueue`：
 ```python
 success = await self.message_queue_client.put_sample( sample=ray.cloudpickle.dumps(rollout_sample), )
 ```
-至此，一个 `RolloutSample` 完成了从 Prompt 读取、异步 Generation、Reward Calculation 到写入 `MessageQueue` 的完整流程。
+至此，一个 `RolloutSample` 就走完了从 Prompt 读取、异步 Generation、Reward Calculation 到进入训练队列的完整流程。
 
 ## FullyAsyncTrainer
 在`FullyAsyncTaskRunner._initialize_components()` 中， `_create_trainer()` 会创建 `FullyAsyncTrainer`：
