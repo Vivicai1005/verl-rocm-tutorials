@@ -1,4 +1,4 @@
-# 深入 verl Fully Async Training：从架构原理到 AMD ROCm 上的 DAPO 训练实践
+# 深入 verl Fully Async Policy Training：从架构原理到 AMD ROCm 上的 DAPO 训练实践
 大语言模型的 RL 训练主要包含两个核心阶段：Rollout 使用当前 Policy 生成训练样本，Training 消费这些样本并更新 Policy。在同步训练中，两者交替执行：Training 必须等待 Rollout 完成，而在模型更新和参数同步期间，Rollout 也需要暂停。这种严格的同步关系会产生大量 Pipeline Bubbles，导致部分 GPU 处于空闲状态。
 
 Fully Async Training 通过独立的 GPU 资源和 Sample Queue 解耦 Rollout 与 Training，使 Rollouter 能够持续生成样本，Trainer 也可以持续消费样本并更新 Policy。与此同时，最新的 Policy 参数会周期性地同步到 Rollouter，从而让样本生成、模型训练和参数同步尽可能重叠执行，减少等待时间并提高 GPU 利用率。由于 Trainer 可能使用旧版本 Policy 生成的样本，系统还需要控制 Policy Staleness，在训练吞吐量与算法稳定性之间取得平衡。
