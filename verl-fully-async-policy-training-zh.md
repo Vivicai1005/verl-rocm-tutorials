@@ -113,15 +113,7 @@ ray.get( self.components["trainer"] .set_message_queue_client.remote(message_que
 ## FullyAsyncRollouter
 在`FullyAsyncTaskRunner._initialize_components()` 中， `_create_rollouter` 会创建并初始化 `FullyAsyncRollouter`：
 ```python
-rollouter = FullyAsyncRollouter.remote(
-    config=config,
-    tokenizer=self.components["tokenizer"],
-    processor=self.components["processor"],
-    device_name=config.trainer.device,
-)
-
-ray.get(rollouter.init_workers.remote())
-ray.get(rollouter.set_max_required_samples.remote())
+trainer = FullyAsyncTrainer.remote( config=config, tokenizer=self.components["tokenizer"], role_worker_mapping=trainer_role_mapping, resource_pool_manager=create_resource_pool_manager( config, roles=list(trainer_role_mapping.keys()), ), ray_worker_group_cls=self.components["ray_worker_group_cls"], device_name=config.trainer.device, )
 ```
 
 `FullyAsyncRollouter` 是 Fully Async Policy Training 中的 Producer， 负责持续读取 Prompt，并以单个样本为粒度发起异步生成任务。
@@ -214,7 +206,7 @@ async def init_workers(self):
 - `FullyAsyncLLMServerManager`: 创建和管理底层 Rollout Replicas，并通过 `GlobalRequestLoadBalancer` 将 Generation Request 路由到可用的 vLLM Server；
 - `FullyAsyncAgentLoopManager`: 把单个样本分发给 AgentLoop Worker。AgentLoop Worker 通过 LLM Client 完成 Generation，并在生成结束后调用 RewardLoop Worker 计算 Reward。
 
-### FullyAsyncRollouter.fit()
+### FullyAsyncTrainer.__init__()
 完成初始化后，`FullyAsyncRollouter.fit()` 会启动持续生成样本的异步流程。其中，`_feed_samples()` 负责从 `DataLoader` 读取 Prompt 并准备 `RolloutSample`，`_processor_worker()` 则负责提交异步 Generation Task。
 
 接下来，我们沿着一个 `RolloutSample` 的数据流，看看它如何完成从 Prompt 读取、Response Generation、Reward Calculation 到写入 `MessageQueue` 的全过程。
@@ -296,23 +288,29 @@ success = await self.message_queue_client.put_sample( sample=ray.cloudpickle.dum
 ```
 至此，一个 `RolloutSample` 就走完了从 Prompt 读取、异步 Generation、Reward Calculation 到进入训练队列的完整流程。
 
+接下来，我们来到 Consumer 一侧，看看 `FullyAsyncTrainer` 如何从 `MessageQueue` 中取出这些样本、更新 Actor Policy，并将最新参数同步回 Rollout Replicas。
+
 ## FullyAsyncTrainer
 在`FullyAsyncTaskRunner._initialize_components()` 中， `_create_trainer()` 会创建 `FullyAsyncTrainer`：
 ```python
 trainer = FullyAsyncTrainer.remote(
-            config=config,
-            tokenizer=self.components["tokenizer"],
-            role_worker_mapping=trainer_role_mapping,
-            resource_pool_manager=create_resource_pool_manager(config, roles=list(trainer_role_mapping.keys())),
-            ray_worker_group_cls=self.components["ray_worker_group_cls"],
-            device_name=config.trainer.device,
-        )
+    config=config,
+    tokenizer=self.components["tokenizer"],
+    role_worker_mapping=trainer_role_mapping,
+    resource_pool_manager=create_resource_pool_manager(
+        config,
+        roles=list(trainer_role_mapping.keys()),
+    ),
+    ray_worker_group_cls=self.components["ray_worker_group_cls"],
+    device_name=config.trainer.device,
+)
 ```
-`FullyAsyncTrainer` 是 Fully Async Training 中的 Consumer。它持续从 `MessageQueue` 中获取 Rollouter 已经生成完成的 Rollout Trajectories，在收集到足够数量后将它们组装成 Training Batch，然后完成 Reward、Log Probability 和 Advantage 等计算，并更新 Actor Policy。
+`FullyAsyncTrainer` 是 Fully Async Training 中的 Consumer。它持续从 `MessageQueue` 中获取 Rollouter 生成的 `RolloutSample`，收集到足够数量后，将这些样本组装成 Training Batch，并完成 Advantage 计算和 Actor Policy Update。
 
-当 Trainer 完成一个参数同步周期后，`CheckpointEngineManager` 会将最新的 Actor Weights 同步到 vLLM Replicas，让 Rollouter 使用新的 Policy Version 继续生成样本。
+当本地训练达到参数同步周期后，Trainer 还会通过 `CheckpointEngineManager` 将最新的 Actor Weights 同步给 vLLM Rollout Replicas。这样，Rollouter 后续生成的样本就可以逐步切换到更新后的 Policy Version。
 
 `FullyAsyncTrainer` 的主要数据流可以概括为：
+```mermaid
 ```mermaid
 sequenceDiagram
     autonumber
@@ -329,48 +327,53 @@ sequenceDiagram
     end
 
     T->>T: Assemble Training Batch
-    T->>T: Compute Reward / Log Prob / Advantage
-
+    T->>T: Prepare Reward / Log Prob / Advantage
     T->>AW: update_actor(batch)
 
     opt Reach Parameter Sync Step
         T->>CE: update_weights()
-        CE->>V: Sync Latest Policy Weights
+        CE->>V: Sync Latest Actor Weights
     end
 ```
 
 ### FullyAsyncTrainer.init()
-`__init__()` 主要保存训练配置，并准备后续 Sample Consumption、Policy Training 和 Parameter Synchronization 需要的状态。
-Trainer 首先根据算法配置判断是否需要 Reference Policy 和 Critic：
+`__init__()` 主要保存训练配置，并准备 Sample Consumption、Policy Training 和 Parameter Synchronization 所需的状态
+Trainer 首先会根据算法配置判断是否需要 Reference Policy 和 Critic：
 ```python
-self.use_reference_policy = need_reference_policy(self.config)
-self.use_critic = need_critic(self.config)
+self.required_samples = (
+    config.actor_rollout_ref.actor.ppo_mini_batch_size
+    * config.async_training.require_batches
+)
 ```
-Actor 是 Policy Training 的核心组件，因此一定会创建；Reference Policy 和 Critic 则只在算法需要时创建。当前 DAPO 使用 GRPO 计算 Advantage，不依赖 Critic Value Model。
+Actor 是 Policy Training 的核心组件，因此一定会创建；Reference Policy 和 Critic 则只在算法需要时创建。
+当前 DAPO 使用 GRPO 计算 Advantage，不依赖 Critic Value Model。如果没有启用 KL Reward 或 KL Loss，通常也不需要额外创建 Reference Policy。
 
-Trainer 还会计算每次 Training Step 需要从 `MessageQueue` 获取多少样本：
+接下来，Trainer 会计算每个 Training Step 需要从 `MessageQueue` 中收集多少个样本：
 ```python
 self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * config.async_training.require_batches
 ```
-只有收集到 required_samples 条 Rollout Trajectories 后，Trainer 才会将它们组装成 Training Batch。
+只有收集到足够数量的 `RolloutSample` 后，Trainer 才会将它们组装成 Training Batch。
 
-最后，`__init__()` 会初始化参数同步状态，并为外部组件预留引用：
+最后，`__init__()` 会初始化参数同步状态，并为其他组件预留引用：
 ```python
 self.local_trigger_step = 1
 self.current_param_version = 0
-self.trigger_parameter_sync_step = config.async_training.trigger_parameter_sync_step 
+self.trigger_parameter_sync_step = (
+    config.async_training.trigger_parameter_sync_step
+)
+
 self.message_queue_client = None
 self.rollouter = None
 self.checkpoint_manager = None
 ```
-这些状态分别用于记录当前同步周期、Policy Version，以及后续连接 `MessageQueue`、`Rolloute` 和 `CheckpointEngineManager`。
+这些状态分别用于记录当前参数同步周期、Policy Version，以及后续连接 `MessageQueue`、Rollouter 和 `CheckpointEngineManager`。
 
 ### FullyAsyncTrainer.init_workers()
-创建 Trainer 后，`FullyAsyncTaskRunner._create_trainer()` 会调用：
+创建 Trainer 后，`FullyAsyncTaskRunner._create_trainer()` 会继续调用：
 ```python
 ray.get(trainer.init_workers.remote())
 ```
-`init_workers()` 会在 Training GPUs 上创建真正执行训练的分布式 Workers：
+`init_workers()` 负责在 Training GPUs 上创建真正执行训练的分布式 Workers：
 ```python
 async def init_workers(self):
     self._init_resource_pools()
@@ -384,12 +387,12 @@ async def init_workers(self):
 ```python
 self.actor_wg = self.all_wg[str(self.train_role)] self.actor_wg.init_model()
 ```
-这里的 `actor_wg` 就是后续真正执行 Policy Training 的 Actor WorkerGroup，负责计算 Policy Loss、反向传播和 Optimizer Step。
+这里的 `actor_wg` 是后续执行 Policy Training 的核心组件，负责计算 Policy Loss、执行反向传播，并通过 Optimizer Step 更新 Actor Parameters。
 
 ### FullyAsyncTrainer.fit()
-`__init__()` 和 `init_workers()` 已经准备好了 Trainer 的运行状态和 Training WorkerGroups。接下来，`FullyAsyncTrainer.fit()` 会开始持续消费 Rollout Samples 并更新 Policy。
+完成运行状态和 Training WorkerGroups 的初始化后，`FullyAsyncTrainer.fit()` 会开始持续消费 Rollout Samples，并更新 Actor Policy。
+它的核心是一个不断执行 `fit_step()` 的循环：
 
-与传统 Trainer 不同，它不会遍历自己的 Training DataLoader，而是不断调用 `fit_step()`：
 ```python
 while True:
     try:
@@ -397,11 +400,11 @@ while True:
     except TrainingStopException:
         break
 ```
-当 Rollouter 完成所有样本生成后，会向 `MessageQueue` 写入一个 None 作为结束信号。Trainer 读取到这个信号后，会抛出 `TrainingStopException` 并退出训练循环。
+当 Rollouter 完成全部生成任务并关闭 `MessageQueue` 后，Trainer 会继续处理队列中剩余的样本。队列耗尽后，`get_sample()` 返回 `None`，Trainer 随即结束训练循环。
 
 #### FullyAsyncTrainer.fit_step()
-`fit_step()` 描述了一个完整 Training Step 的核心流程：
-```
+`fit_step()` 描述了一次 Training Step 的核心流程：
+```python
 batch = await self._fit_generate(None)
 
 batch = self._fit_compute_reward(batch)
@@ -417,8 +420,7 @@ self._fit_update_local_step()
 await self._fit_update_weights()
 ```
 
-下面我们沿着一批 RolloutSample，看看它们如何从 MessageQueue 进入 Trainer，并最终完成一次 Policy Update。
-
+接下来，我们沿着一批 `RolloutSample` 的流动过程，看看 Trainer 如何完成一次 Policy Update。
 (1) MessageQueue → RolloutSample
 
 一次 Training Step 从 `_fit_generate()` 开始：
