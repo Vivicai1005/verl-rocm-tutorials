@@ -518,3 +518,38 @@ await self.rollouter.reset_staleness()
 ```
 Rollouter 随后便可以使用新的 Policy Version 继续生成样本，而 Trainer 也会继续从 `MessageQueue` 中消费已经准备好的数据。
 通过这种“持续消费样本、独立更新 Actor、周期性同步参数”的方式，Rollout Generation 和 Policy Training 不需要在每个 Batch 上等待彼此，从而能够在不同的 GPU 资源上保持异步运行。
+
+前面我们已经从源码层面梳理了 `Fully Async Policy Training` 的完整执行流程，包括 `FullyAsyncRollouter` 如何持续生成样本并写入 `MessageQueue`，`FullyAsyncTrainer` 如何消费样本完成 Actor Update，以及 `CheckpointEngineManager` 如何周期性地将最新 Policy Weights 同步到 vLLM Rollout Replicas。理解这些核心组件如何协同工作之后，下一步就是把这套异步训练流程真正运行起来，看看它在实际 GPU 环境中是如何工作的。
+
+
+## 在 AMD Instinct™ GPU 上动手实践 verl Fully Async Policy DAPO 训练
+
+ROCm 已经作为 verl 官方支持的 Platform Backend 集成到统一的平台抽象中。verl 提供了 [`PlatformROCm`](https://github.com/verl-project/verl/blob/main/verl/plugin/platform/platform_rocm.py) 来识别 AMD ROCm 环境，并复用 PyTorch ROCm 提供的 CUDA-compatible API，使 verl 的训练、Rollout 和分布式执行等上层逻辑可以继续使用统一的代码路径，而底层计算则由 ROCm/HIP 以及对应的 AMD GPU Software Stack 完成。
+
+如果你想直接动手实践，可以点击 [AMD Developer Cloud](https://cloud.oneclickamd.ai/templates/1920/preview) 启动本教程对应的 Notebook，并在 AMD Instinct™ GPU 上运行一次完整的 Fully Async Policy DAPO Training。
+
+在这次实践中，我们使用与前文相同的 Fully Async 架构。训练数据使用 **DAPO-Math-17k**，验证数据使用 **AIME 2024**。为了降低实验所需的硬件资源，我们利用 AMD Instinct™ GPU 的大显存，将官方示例中的 **4 Training GPUs + 4 Rollout GPUs** 缩减为 **2 Training GPUs + 2 Rollout GPUs**，仅使用 **4 个 GPU** 即可完成完整的 Fully Async DAPO Training 流程。
+
+从实际训练结果来看，即使将配置缩减到 **2 Training GPUs + 2 Rollout GPUs**，训练依然表现出稳定且明确的优化趋势。其中，`val-core/math_dapo/acc/mean@1` 表示模型在 **AIME 2024 验证集**上的平均准确率，可以看到该指标随着 Training Step 持续提升，说明 Policy 在数学推理任务上的表现正在逐步改善。
+
+`val-core/math_dapo/acc/mean@1` 随着 Training Step 持续提升:
+<p align="center">
+  <img src="./images/acc.png" width="900">
+</p>
+
+<p align="center">
+  <em>Validation accuracy (`val-core/math_dapo/acc/mean@1`) during Fully Async Policy DAPO Training.</em>
+</p>
+
+与此同时，`actor/pg_loss` 在训练初期快速下降，并在随后大部分 Training Steps 中维持在较低水平，仅出现正常的小幅波动。这表明 Actor 的 Policy Update 已经进入相对稳定的优化阶段，没有观察到明显的 Loss 发散现象。
+<p align="center">
+  <img src="./images/loss.png" width="900">
+</p>
+
+<p align="center">
+  <em>Actor policy gradient loss (`actor/pg_loss`) during Fully Async DAPO Training.</em>
+</p>
+
+结合这两个指标可以看到，在 AMD Instinct™ GPU 上，**2 Training GPUs + 2 Rollout GPUs** 的 Fully Async DAPO Training 能够正常运行，并呈现出持续的性能提升和稳定的训练行为。
+
+如果你希望进一步了解环境准备、训练参数配置、训练启动以及 Fully Async Metrics 的含义，可以直接进入 [AMD Developer Cloud Notebook](https://cloud.oneclickamd.ai/templates/1920/preview) 跟随教程完成完整实践。
