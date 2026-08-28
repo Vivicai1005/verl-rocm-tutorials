@@ -552,4 +552,4 @@ ROCm 已经作为 verl 官方支持的 Platform Backend 集成到统一的平台
 
 结合这两个指标可以看到，在 AMD Instinct™ GPU 上，**2 Training GPUs + 2 Rollout GPUs** 的 Fully Async DAPO Training 能够正常运行，并呈现出持续的性能提升和稳定的训练行为。
 
-如果你希望进一步了解环境准备、训练参数配置、训练启动以及 Fully Async Metrics 的含义，可以直接进入 [AMD Developer Cloud Notebook](https://cloud.oneclickamd.ai/templates/1920/preview) 跟随教程完成完整实践。
+如果你希望进一步了解环境准备、训练参数配置、训练启动以及 Fully Async Metrics 的含义，可以直接进入 [AMD Developer Cloud Notebook](https://cloud.oneclickamd.ai/templates/1925/preview) 跟随教程完成完整实践。
