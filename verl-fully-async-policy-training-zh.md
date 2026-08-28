@@ -1,6 +1,6 @@
 # 深入 verl Fully Async Policy Training: 从架构原理到 AMD ROCm 上的 DAPO 训练实践
 
-> **想直接动手实践？** 我们还准备了一份 [Fully Async Policy DAPO Notebook 实操教程](https://cloud.oneclickamd.ai/templates/1920/preview) ，可以直接在 AMD Developer Cloud 中打开并运行。教程将带你在 AMD Instinct™ GPU 上完成环境检查、参数配置、训练启动和 Metrics 分析。本文则重点介绍 Fully Async Policy Training 的架构设计与源码实现。
+> **想直接动手实践？** 我们还准备了一份 [Fully Async Policy DAPO Notebook 实操教程](https://cloud.oneclickamd.ai/templates/1925/preview) ，可以直接在 AMD Developer Cloud 中打开并运行。教程将带你在 AMD Instinct™ GPU 上完成环境检查、参数配置、训练启动和 Metrics 分析。本文则重点介绍 Fully Async Policy Training 的架构设计与源码实现。
 
 大语言模型的 RL 训练主要围绕两个过程展开：Rollout 使用当前 Policy 生成训练样本，Training 使用这些样本更新 Policy。在同步训练中，它们只能交替运行：Training 要等 Rollout 生成完样本才能开始，而在模型更新和参数同步期间，Rollout 也不得不停下来等待。这样的同步方式会产生不少 Pipeline Bubbles，让部分 GPU 在等待期间处于空闲状态。
 
