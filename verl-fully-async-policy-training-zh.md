@@ -526,7 +526,7 @@ Rollouter 随后便可以使用新的 Policy Version 继续生成样本，而 Tr
 
 ROCm 已经作为 verl 官方支持的 Platform Backend 集成到统一的平台抽象中。verl 提供了 [`PlatformROCm`](https://github.com/verl-project/verl/blob/main/verl/plugin/platform/platform_rocm.py) 来识别 AMD ROCm 环境，并复用 PyTorch ROCm 提供的 CUDA-compatible API，使 verl 的训练、Rollout 和分布式执行等上层逻辑可以继续使用统一的代码路径，而底层计算则由 ROCm/HIP 以及对应的 AMD GPU Software Stack 完成。
 
-如果你想直接动手实践，可以点击 [AMD Developer Cloud](https://cloud.oneclickamd.ai/templates/1920/preview) 启动本教程对应的 Notebook，并在 AMD Instinct™ GPU 上运行一次完整的 Fully Async Policy DAPO Training。
+如果你想直接动手实践，可以点击 [AMD Developer Cloud](https://cloud.oneclickamd.ai/templates/1925/preview) 启动本教程对应的 Notebook，并在 AMD Instinct™ GPU 上运行一次完整的 Fully Async Policy DAPO Training。
 
 在这次实践中，我们使用与前文相同的 Fully Async 架构。训练数据使用 **DAPO-Math-17k**，验证数据使用 **AIME 2024**。为了降低实验所需的硬件资源，我们利用 AMD Instinct™ GPU 的大显存，将官方示例中的 **4 Training GPUs + 4 Rollout GPUs** 缩减为 **2 Training GPUs + 2 Rollout GPUs**，仅使用 **4 个 GPU** 即可完成完整的 Fully Async DAPO Training 流程。
 
